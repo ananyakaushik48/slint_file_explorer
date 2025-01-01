@@ -18,12 +18,12 @@ slint::slint! {
 
     global Palette {
         out property <Theme> theme: {
-            primary: #1a1a1a,
-            secondary: #2d2d2d,
-            text: #ffffff,
-            accent: #007acc,
-            hover: #3d3d3d,
-            background: #000000,
+            primary: #1a1a1aff,
+            secondary: #2d2d2dff,
+            text: #ffffffff,
+            accent: #007accff,
+            hover: #3d3d3dff,
+            background: #000000ff,
         };
     }
 
@@ -232,10 +232,8 @@ fn format_time(time: SystemTime) -> String {
 
 struct SearchState {
     query: String,
-    results: Vec<slint::SharedString>,
     is_searching: bool,
 }
-
 fn main() {
     let app = MainWindow::new().unwrap();
     let weak = app.as_weak();
@@ -248,7 +246,6 @@ fn main() {
     let current_path = Arc::new(Mutex::new(PathBuf::from(root_path)));
     let search_state = Arc::new(Mutex::new(SearchState {
         query: String::new(),
-        results: Vec::new(),
         is_searching: false,
     }));
 
