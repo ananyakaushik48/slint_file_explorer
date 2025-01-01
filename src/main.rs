@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -12,7 +11,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use regex::RegexBuilder;
 use std::os::unix::fs::PermissionsExt;
 
-// Slint generates this module name from the code below:
+// Use the Slint-generated `FileEntry` from the .slint code below
 use crate::slint_generatedMainWindow::FileEntry as SlintFileEntry;
 
 slint::slint! {
@@ -298,41 +297,46 @@ fn create_file_entry(path: &Path, metadata: &fs::Metadata) -> SlintFileEntry {
 }
 
 // -----------------------------------------------------------------------------
-// BFS Search
+// Pre-Order DFS Search
 // -----------------------------------------------------------------------------
 
-/// BFS over directories, searching for files whose names match `pattern`.
-/// Sends matches to `tx`.
-fn bfs_search(root_dir: String, pattern: &regex::Regex, tx: mpsc::Sender<SlintFileEntry>) {
-    use std::collections::VecDeque;
-    let mut queue = VecDeque::new();
-    queue.push_back(PathBuf::from(&root_dir));
+/// Perform a **pre-order DFS** with a stack:
+///  1) For each popped directory, immediately check filenames for a match
+///  2) If directory, push it on the stack
+/// This approach can be faster in some cases than BFS.
+fn dfs_search(root_dir: String, pattern: &regex::Regex, tx: mpsc::Sender<SlintFileEntry>) {
+    let mut stack = vec![PathBuf::from(&root_dir)];
 
-    while let Some(current_dir) = queue.pop_front() {
-        let rd = match fs::read_dir(&current_dir) {
-            Ok(it) => it,
-            Err(_) => continue,
+    while let Some(dir) = stack.pop() {
+        // Attempt to read this directory
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue, // skip directories we cannot read
         };
 
-        for entry in rd {
+        for entry in entries {
             let entry = match entry {
-                Ok(e) => e,
+                Ok(ent) => ent,
                 Err(_) => continue,
             };
             let path = entry.path();
+            let filename = match path.file_name() {
+                Some(fname) => fname.to_string_lossy(),
+                None => continue,
+            };
 
-            // If it's a directory, enqueue
-            if path.is_dir() {
-                queue.push_back(path.clone());
-            }
-
-            // Check if filename matches
-            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            // **Only** call fs::metadata if filename matches pattern
             if pattern.is_match(&filename) {
                 if let Ok(md) = fs::metadata(&path) {
                     let fe = create_file_entry(&path, &md);
+                    // Send result
                     let _ = tx.send(fe);
                 }
+            }
+
+            // Pre-order DFS: if directory, push to stack
+            if path.is_dir() {
+                stack.push(path);
             }
         }
     }
@@ -362,7 +366,7 @@ fn main() {
         is_searching: false,
     }));
 
-    // 1) Show immediate directory listing
+    // 1) Listing the immediate directory
     let list_files: Arc<dyn Fn(&MainWindow)> = {
         let current_path = Arc::clone(&current_path);
         Arc::new(move |app: &MainWindow| {
@@ -380,6 +384,7 @@ fn main() {
                 }
             }
 
+            // Sort directories first, then by name
             entries.sort_by(|a, b| {
                 match (a.is_directory, b.is_directory) {
                     (true, false) => std::cmp::Ordering::Less,
@@ -392,7 +397,7 @@ fn main() {
         })
     };
 
-    // 2) BFS-based search
+    // 2) DFS-based searching (spawns a background thread)
     let setup_search: Arc<dyn Fn(String) + 'static> = {
         let app_weak = weak.clone();
         let search_state = Arc::clone(&search_state);
@@ -404,7 +409,7 @@ fn main() {
                 None => return,
             };
 
-            // Empty query => no searching
+            // If empty, no search
             if query.is_empty() {
                 let mut state = search_state.lock().unwrap();
                 state.is_searching = false;
@@ -419,32 +424,31 @@ fn main() {
             }
             app.set_is_searching(true);
 
+            // Build the (case-insensitive) regex pattern
             let pattern = RegexBuilder::new(&regex::escape(&query))
                 .case_insensitive(true)
                 .build()
                 .unwrap_or_else(|_| RegexBuilder::new("").build().unwrap());
 
-            // Create the channel
+            // Channel
             let (tx, rx) = mpsc::channel();
             let app_weak = app_weak.clone();
             let search_state = Arc::clone(&search_state);
 
-            // Clone root_path for this thread
             let root_path_clone = root_path.clone();
 
             thread::spawn(move || {
-                // BFS search, sending results to tx
-                bfs_search(root_path_clone, &pattern, tx);
+                // Pre-order DFS
+                dfs_search(root_path_clone, &pattern, tx);
 
-                // Collect all results
+                // Collect matches
                 let mut results = Vec::new();
-                // We do NOT call drop(tx) here, so tx is dropped automatically at end of scope
-                // That notifies rx that no more items are coming
+                // No explicit drop(tx); automatically dropped here
                 while let Ok(fe) = rx.recv() {
                     results.push(fe);
                 }
 
-                // Sort results
+                // Sort directories first, then by name
                 results.sort_by(|a, b| {
                     match (a.is_directory, b.is_directory) {
                         (true, false) => std::cmp::Ordering::Less,
@@ -453,20 +457,22 @@ fn main() {
                     }
                 });
 
+                // Update UI if alive
                 if let Some(app) = app_weak.upgrade() {
                     let mut state = search_state.lock().unwrap();
                     state.is_searching = false;
                     drop(state);
                     app.set_is_searching(false);
 
-                    // If Slint requires the main thread, do slint::invoke_from_event_loop(...) here.
+                    // If your Slint requires the main thread, do:
+                    // slint::invoke_from_event_loop(move || { app.set_files(...); });
                     app.set_files(ModelRc::from(Rc::new(VecModel::from(results))));
                 }
             });
         })
     };
 
-    // 3) Connect UI callbacks
+    // 3) Hook up UI callbacks
     {
         let setup_search = Arc::clone(&setup_search);
         let search_state = Arc::clone(&search_state);
