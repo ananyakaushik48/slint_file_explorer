@@ -1,8 +1,19 @@
-use std::{fs, path::PathBuf, process::Command, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    rc::Rc,
+    sync::{mpsc, Arc, Mutex, Weak},
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use slint::{ModelRc, SharedString, VecModel};
-use std::sync::Mutex;
-use walkdir::WalkDir;
-use std::thread;
+use regex::RegexBuilder;
+use std::os::unix::fs::PermissionsExt;
+
+// Slint generates this module name from the code below:
+use crate::slint_generatedMainWindow::FileEntry as SlintFileEntry;
 
 slint::slint! {
     import { Button, VerticalBox, ListView } from "std-widgets.slint";
@@ -14,6 +25,10 @@ slint::slint! {
         accent: brush,
         hover: brush,
         background: brush,
+        directory: brush,
+        executable: brush,
+        file: brush,
+        hover-text: brush,
     }
 
     global Palette {
@@ -24,12 +39,17 @@ slint::slint! {
             accent: #007accff,
             hover: #3d3d3dff,
             background: #000000ff,
+            executable: #ce9178ff,
+            directory: #ff8c00ff,
+            file: #9cdcfeff,
+            hover-text: #000000ff,
         };
     }
 
     export struct FileEntry {
         name: string,
         is_directory: bool,
+        is_executable: bool,
         path: string,
         size: string,
         modified: string,
@@ -38,7 +58,7 @@ slint::slint! {
     component SearchBar {
         callback search-changed(string);
         callback search-submitted();
-        
+
         Rectangle {
             background: Palette.theme.secondary;
             border-radius: 4px;
@@ -67,10 +87,11 @@ slint::slint! {
         in property <FileEntry> entry;
         callback clicked();
         callback double-clicked();
-        
+
         Rectangle {
-            background: ta.pressed ? Palette.theme.accent : 
-                       ta.has-hover ? Palette.theme.hover : transparent;
+            background: ta.pressed ? Palette.theme.accent
+                       : ta.has-hover ? Palette.theme.hover
+                       : transparent;
             border-radius: 4px;
 
             ta := TouchArea {
@@ -82,27 +103,33 @@ slint::slint! {
                 padding: 12px;
                 spacing: 12px;
 
-                // Icon representation using text
                 Text {
-                    text: root.entry.is_directory ? "📁" : "📄";
+                    text: root.entry.is_directory ? "📁"
+                         : root.entry.is_executable ? "⚡"
+                         : "📄";
                     font-size: 16px;
                 }
 
-                Text { 
+                Text {
                     text: root.entry.name;
-                    color: Palette.theme.text;
+                    color: ta.has-hover ? Palette.theme.hover-text
+                           : root.entry.is_directory ? Palette.theme.directory
+                           : root.entry.is_executable ? Palette.theme.executable
+                           : Palette.theme.file;
                     font-size: 14px;
                 }
 
-                Text { 
+                Text {
                     text: root.entry.size;
-                    color: Palette.theme.text;
+                    color: ta.has-hover ? Palette.theme.hover-text
+                           : Palette.theme.text;
                     font-size: 14px;
                 }
 
-                Text { 
+                Text {
                     text: root.entry.modified;
-                    color: Palette.theme.text;
+                    color: ta.has-hover ? Palette.theme.hover-text
+                           : Palette.theme.text;
                     font-size: 14px;
                 }
             }
@@ -113,13 +140,14 @@ slint::slint! {
         in-out property <[FileEntry]> files: [];
         in-out property <string> current-path: "/";
         in-out property <bool> is-searching: false;
+
         callback navigate(string);
         callback open-file(string);
         callback up-directory();
         callback go-to-root();
         callback search-text-changed(string);
         callback search-submitted();
-        
+
         title: "File Explorer Pro";
         background: Palette.theme.background;
         min-width: 900px;
@@ -134,15 +162,15 @@ slint::slint! {
                 height: 36px;
 
                 VerticalBox {
-                    Button { 
-                        text: "Up";
+                    Button {
+                        text: "⬆️ Up";
                         clicked => { root.up-directory(); }
                     }
                 }
 
                 VerticalBox {
-                    Button { 
-                        text: "Root";
+                    Button {
+                        text: "🏠 Root";
                         clicked => { root.go-to-root(); }
                     }
                 }
@@ -150,7 +178,7 @@ slint::slint! {
                 Rectangle {
                     background: Palette.theme.secondary;
                     border-radius: 4px;
-                    Text { 
+                    Text {
                         text: root.current-path;
                         color: Palette.theme.text;
                         font-size: 14px;
@@ -171,7 +199,7 @@ slint::slint! {
             if root.is-searching: Rectangle {
                 height: 24px;
                 Text {
-                    text: "Searching...";
+                    text: "🔍 Searching...";
                     color: Palette.theme.text;
                     font-size: 14px;
                 }
@@ -202,6 +230,10 @@ slint::slint! {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+
 fn format_size(size: u64) -> String {
     if size < 1024 {
         format!("{}B", size)
@@ -217,229 +249,351 @@ fn format_size(size: u64) -> String {
 fn format_time(time: SystemTime) -> String {
     if let Ok(duration) = time.duration_since(UNIX_EPOCH) {
         let secs = duration.as_secs();
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}",
-            1970 + (secs / 31536000),
-            ((secs % 31536000) / 2592000) + 1,
-            ((secs % 2592000) / 86400) + 1,
-            (secs % 86400) / 3600,
-            (secs % 3600) / 60
-        )
+        let years = 1970 + (secs / 31_536_000);
+        let months = ((secs % 31_536_000) / 2_592_000) + 1;
+        let days = ((secs % 2_592_000) / 86_400) + 1;
+        let hours = (secs % 86_400) / 3_600;
+        let minutes = (secs % 3_600) / 60;
+        format!("{:04}-{:02}-{:02} {:02}:{:02}", years, months, days, hours, minutes)
     } else {
         String::from("Unknown")
     }
 }
 
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(metadata) = fs::metadata(path) {
+            return metadata.permissions().mode() & 0o111 != 0;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(ext) = path.extension() {
+            return ext.eq_ignore_ascii_case("exe")
+                || ext.eq_ignore_ascii_case("bat")
+                || ext.eq_ignore_ascii_case("cmd")
+                || ext.eq_ignore_ascii_case("com");
+        }
+    }
+    false
+}
+
+fn create_file_entry(path: &Path, metadata: &fs::Metadata) -> SlintFileEntry {
+    SlintFileEntry {
+        name: SharedString::from(
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        ),
+        is_directory: path.is_dir(),
+        is_executable: is_executable(path),
+        path: SharedString::from(path.to_string_lossy().to_string()),
+        size: SharedString::from(format_size(metadata.len())),
+        modified: SharedString::from(format_time(
+            metadata.modified().unwrap_or(SystemTime::now())
+        )),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// BFS Search
+// -----------------------------------------------------------------------------
+
+/// BFS over directories, searching for files whose names match `pattern`.
+/// Sends matches to `tx`.
+fn bfs_search(root_dir: String, pattern: &regex::Regex, tx: mpsc::Sender<SlintFileEntry>) {
+    use std::collections::VecDeque;
+    let mut queue = VecDeque::new();
+    queue.push_back(PathBuf::from(&root_dir));
+
+    while let Some(current_dir) = queue.pop_front() {
+        let rd = match fs::read_dir(&current_dir) {
+            Ok(it) => it,
+            Err(_) => continue,
+        };
+
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+
+            // If it's a directory, enqueue
+            if path.is_dir() {
+                queue.push_back(path.clone());
+            }
+
+            // Check if filename matches
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            if pattern.is_match(&filename) {
+                if let Ok(md) = fs::metadata(&path) {
+                    let fe = create_file_entry(&path, &md);
+                    let _ = tx.send(fe);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SearchState + Main
+// -----------------------------------------------------------------------------
+
 struct SearchState {
     query: String,
     is_searching: bool,
 }
+
 fn main() {
     let app = MainWindow::new().unwrap();
     let weak = app.as_weak();
-    
+
     #[cfg(target_os = "windows")]
-    let root_path = "C:\\";
+    let root_path = "C:\\".to_string();
     #[cfg(not(target_os = "windows"))]
-    let root_path = "/";
-    
-    let current_path = Arc::new(Mutex::new(PathBuf::from(root_path)));
+    let root_path = "/".to_string();
+
+    let current_path = Arc::new(Mutex::new(PathBuf::from(&root_path)));
     let search_state = Arc::new(Mutex::new(SearchState {
         query: String::new(),
         is_searching: false,
     }));
 
-    // Create list_files function with explicit type annotation
-    let list_files: Arc<dyn Fn(&MainWindow) + Send + Sync> = Arc::new({
-        let current_path = current_path.clone();
-        move |app: &MainWindow| {
+    // 1) Show immediate directory listing
+    let list_files: Arc<dyn Fn(&MainWindow)> = {
+        let current_path = Arc::clone(&current_path);
+        Arc::new(move |app: &MainWindow| {
             let path = current_path.lock().unwrap();
             let mut entries = Vec::new();
-            
+
             if let Ok(dir_entries) = fs::read_dir(&*path) {
-                for entry in dir_entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if let Ok(metadata) = fs::metadata(&path) {
-                            entries.push(FileEntry {
-                                name: SharedString::from(path.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string()),
-                                is_directory: path.is_dir(),
-                                path: SharedString::from(path.to_string_lossy().to_string()),
-                                size: SharedString::from(format_size(metadata.len())),
-                                modified: SharedString::from(format_time(
-                                    metadata.modified().unwrap_or(SystemTime::now())
-                                )),
-                            });
+                for e in dir_entries {
+                    if let Ok(entry) = e {
+                        let p = entry.path();
+                        if let Ok(md) = fs::metadata(&p) {
+                            entries.push(create_file_entry(&p, &md));
                         }
                     }
                 }
             }
 
             entries.sort_by(|a, b| {
-                if a.is_directory == b.is_directory {
-                    a.name.cmp(&b.name)
-                } else {
-                    b.is_directory.cmp(&a.is_directory)
+                match (a.is_directory, b.is_directory) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.as_str().cmp(b.name.as_str()),
                 }
             });
 
-            app.set_files(ModelRc::new(VecModel::from(entries)));
-        }
-    });
+            app.set_files(ModelRc::from(Rc::new(VecModel::from(entries))));
+        })
+    };
 
-    // Setup UI callbacks with proper cloning
-    {
+    // 2) BFS-based search
+    let setup_search: Arc<dyn Fn(String) + 'static> = {
         let app_weak = weak.clone();
-        let search_state = search_state.clone();
-        let list_files = list_files.clone();
-        app.on_search_text_changed(move |text: SharedString| {
-            let app = app_weak.unwrap();
-            let mut state = search_state.lock().unwrap();
-            state.query = text.to_string();
-            
-            if state.query.is_empty() {
+        let search_state = Arc::clone(&search_state);
+        let root_path = root_path.clone();
+
+        Arc::new(move |query: String| {
+            let app = match app_weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
+
+            // Empty query => no searching
+            if query.is_empty() {
+                let mut state = search_state.lock().unwrap();
                 state.is_searching = false;
-                app.set_is_searching(false);
                 drop(state);
-                list_files(&app);
-            }
-        });
-    }
-
-    {
-        let app_weak = weak.clone();
-        let search_state = search_state.clone();
-        app.on_search_submitted(move || {
-            let app = app_weak.unwrap();
-            let mut state = search_state.lock().unwrap();
-            
-            if state.query.is_empty() {
+                app.set_is_searching(false);
                 return;
             }
 
-            state.is_searching = true;
+            {
+                let mut state = search_state.lock().unwrap();
+                state.is_searching = true;
+            }
             app.set_is_searching(true);
-            let query = state.query.clone();
-            drop(state);
 
-            // Spawn search thread
-            let search_state = search_state.clone();
+            let pattern = RegexBuilder::new(&regex::escape(&query))
+                .case_insensitive(true)
+                .build()
+                .unwrap_or_else(|_| RegexBuilder::new("").build().unwrap());
+
+            // Create the channel
+            let (tx, rx) = mpsc::channel();
             let app_weak = app_weak.clone();
+            let search_state = Arc::clone(&search_state);
+
+            // Clone root_path for this thread
+            let root_path_clone = root_path.clone();
+
             thread::spawn(move || {
+                // BFS search, sending results to tx
+                bfs_search(root_path_clone, &pattern, tx);
+
+                // Collect all results
                 let mut results = Vec::new();
-                
-                for entry in WalkDir::new(root_path)
-                    .follow_links(true)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                {
-                    let path = entry.path();
-                    if let Ok(metadata) = fs::metadata(path) {
-                        let name = path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        
-                        if name.to_lowercase().contains(&query.to_lowercase()) {
-                            results.push(FileEntry {
-                                name: SharedString::from(name),
-                                is_directory: path.is_dir(),
-                                path: SharedString::from(path.to_string_lossy().to_string()),
-                                size: SharedString::from(format_size(metadata.len())),
-                                modified: SharedString::from(format_time(
-                                    metadata.modified().unwrap_or(SystemTime::now())
-                                )),
-                            });
-                        }
-                    }
+                // We do NOT call drop(tx) here, so tx is dropped automatically at end of scope
+                // That notifies rx that no more items are coming
+                while let Ok(fe) = rx.recv() {
+                    results.push(fe);
                 }
+
+                // Sort results
+                results.sort_by(|a, b| {
+                    match (a.is_directory, b.is_directory) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.name.as_str().cmp(b.name.as_str()),
+                    }
+                });
 
                 if let Some(app) = app_weak.upgrade() {
                     let mut state = search_state.lock().unwrap();
                     state.is_searching = false;
+                    drop(state);
                     app.set_is_searching(false);
-                    app.set_files(ModelRc::new(VecModel::from(results)));
+
+                    // If Slint requires the main thread, do slint::invoke_from_event_loop(...) here.
+                    app.set_files(ModelRc::from(Rc::new(VecModel::from(results))));
                 }
             });
+        })
+    };
+
+    // 3) Connect UI callbacks
+    {
+        let setup_search = Arc::clone(&setup_search);
+        let search_state = Arc::clone(&search_state);
+        let weak = weak.clone();
+        let list_files = Arc::clone(&list_files);
+
+        app.on_search_text_changed(move |text: SharedString| {
+            let mut state = search_state.lock().unwrap();
+            state.query = text.to_string();
+
+            if text.is_empty() {
+                state.is_searching = false;
+                drop(state);
+                let app = match weak.upgrade() {
+                    Some(a) => a,
+                    None => return,
+                };
+                app.set_is_searching(false);
+                list_files(&app);
+            } else {
+                (setup_search)(state.query.clone());
+            }
         });
     }
 
     {
+        let setup_search = Arc::clone(&setup_search);
+        let search_state = Arc::clone(&search_state);
+
+        app.on_search_submitted(move || {
+            if let Ok(state) = search_state.lock() {
+                if !state.query.is_empty() {
+                    (setup_search)(state.query.clone());
+                }
+            }
+        });
+    }
+
+    // Up directory
+    {
         let app_weak = weak.clone();
-        let current_path = current_path.clone();
-        let list_files = list_files.clone();
+        let current_path = Arc::clone(&current_path);
+        let list_files = Arc::clone(&list_files);
+
         app.on_up_directory(move || {
-            let app = app_weak.unwrap();
+            let app = match app_weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
             let mut current = current_path.lock().unwrap();
             if let Some(parent) = current.parent() {
                 *current = parent.to_path_buf();
-                app.set_current_path(SharedString::from(
-                    current.to_string_lossy().to_string()
-                ));
+                app.set_current_path(SharedString::from(current.to_string_lossy().to_string()));
                 drop(current);
                 list_files(&app);
             }
         });
     }
 
+    // Go to root
     {
         let app_weak = weak.clone();
-        let current_path = current_path.clone();
-        let list_files = list_files.clone();
+        let current_path = Arc::clone(&current_path);
+        let list_files = Arc::clone(&list_files);
+        let root_path_clone = root_path.clone();
+
         app.on_go_to_root(move || {
-            let app = app_weak.unwrap();
+            let app = match app_weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
             let mut current = current_path.lock().unwrap();
-            *current = PathBuf::from(root_path);
-            app.set_current_path(SharedString::from(root_path));
+            *current = PathBuf::from(&root_path_clone);
+            app.set_current_path(SharedString::from(root_path_clone.clone()));
             drop(current);
             list_files(&app);
         });
     }
 
-    app.on_open_file(move |path: SharedString| {
-        #[cfg(target_os = "windows")]
-        Command::new("cmd")
-            .args(["/C", "start", "", &path])
-            .spawn()
-            .ok();
+    // Open file
+    {
+        let weak = weak.clone();
+        app.on_open_file(move |path: SharedString| {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = Command::new("cmd")
+                    .args(["/C", "start", "", &path])
+                    .spawn();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let _ = Command::new("xdg-open")
+                    .arg(&path)
+                    .spawn();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = Command::new("open")
+                    .arg(&path)
+                    .spawn();
+            }
+        });
+    }
 
-        #[cfg(target_os = "linux")]
-        Command::new("xdg-open")
-            .arg(&path)
-            .spawn()
-            .ok();
-
-        #[cfg(target_os = "macos")]
-        Command::new("open")
-            .arg(&path)
-            .spawn()
-            .ok();
-    });
-
+    // Navigate
     {
         let app_weak = weak.clone();
-        let current_path = current_path.clone();
-        let list_files = list_files.clone();
+        let current_path = Arc::clone(&current_path);
+        let list_files = Arc::clone(&list_files);
+
         app.on_navigate(move |path: SharedString| {
-            let app = app_weak.unwrap();
+            let app = match app_weak.upgrade() {
+                Some(a) => a,
+                None => return,
+            };
             let mut current = current_path.lock().unwrap();
-            
             let new_path = PathBuf::from(path.as_str());
             if new_path.exists() {
                 *current = new_path;
-                app.set_current_path(SharedString::from(
-                    current.to_string_lossy().to_string()
-                ));
+                app.set_current_path(SharedString::from(current.to_string_lossy().to_string()));
                 drop(current);
                 list_files(&app);
             }
         });
     }
 
-    // Initial file listing
+    // 4) Initial listing + run
     list_files(&app);
     app.run().unwrap();
 }
